@@ -6,6 +6,7 @@ CLI Chat with your trained friend chatbot
 import torch
 import os
 from model import Vocabulary, Seq2Seq
+from torch.serialization import add_safe_globals
 
 def load_model():
     """Load the trained model"""
@@ -15,11 +16,55 @@ def load_model():
         return None, None
     
     print("📂 Loading model...")
-    checkpoint = torch.load('chatbot_model.pth', map_location='cpu')
-    vocab = checkpoint['vocab']
+    # Try a safe weights-only load first (newer PyTorch defaults to weights_only=True).
+    checkpoint = None
+    used_unsafe_load = False
+    try:
+        checkpoint = torch.load('chatbot_model.pth', map_location='cpu')
+    except Exception as e:
+        # Fallback: allowlist Vocabulary for unpickling if file was saved with objects
+        try:
+            from torch.serialization import safe_globals
+            with safe_globals([Vocabulary]):
+                checkpoint = torch.load('chatbot_model.pth', map_location='cpu', weights_only=False)
+                used_unsafe_load = True
+        except Exception:
+            # last resort: try loading without safe_globals (less safe)
+            checkpoint = torch.load('chatbot_model.pth', map_location='cpu', weights_only=False)
+            used_unsafe_load = True
+
+    # Reconstruct vocabulary object from serializable fields if necessary
+    if 'vocab_word2idx' in checkpoint and 'vocab_idx2word' in checkpoint:
+        vocab = Vocabulary()
+        vocab.word2idx = checkpoint['vocab_word2idx']
+        vocab.idx2word = checkpoint['vocab_idx2word']
+    elif 'vocab' in checkpoint and isinstance(checkpoint['vocab'], dict):
+        vocab = Vocabulary()
+        vocab.word2idx = checkpoint['vocab'].get('word2idx', {})
+        vocab.idx2word = checkpoint['vocab'].get('idx2word', {})
+    elif 'vocab' in checkpoint:
+        # already an object (was unpickled)
+        vocab = checkpoint['vocab']
+    else:
+        # No vocab saved in known format — build a minimal one from vocab_size if available
+        vocab = Vocabulary()
+
     model = Seq2Seq(len(vocab))
     model.load_state_dict(checkpoint['model'])
     model.eval()
+
+    # If we had to load the file unsafely, rewrite it using serializable vocab dicts
+    if used_unsafe_load:
+        try:
+            torch.save({
+                'model': checkpoint['model'],
+                'vocab_word2idx': vocab.word2idx,
+                'vocab_idx2word': vocab.idx2word,
+                'vocab_size': len(vocab)
+            }, 'chatbot_model.pth')
+        except Exception:
+            pass
+
     print("✅ Model loaded!")
     return model, vocab
 
